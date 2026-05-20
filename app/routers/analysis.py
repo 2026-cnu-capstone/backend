@@ -9,6 +9,7 @@ from app.agent_bridge import (
     approve_strategy,
     execute_analysis,
     generate_report,
+    get_node_graph,
     get_session_status,
     request_cancel,
     start_analysis,
@@ -67,9 +68,10 @@ async def api_execute_analysis(case_id: str):
     """승인된 계획 실행 (WebSocket으로 진행상황 push)"""
     try:
         result = await execute_analysis(case_id)
-        await ws_manager.send_event(case_id, "execution_done", {
-            "task_results": result["task_results"],
-        })
+        event_data = {"task_results": result["task_results"]}
+        if result.get("node_graph"):
+            event_data["node_graph"] = result["node_graph"]
+        await ws_manager.send_event(case_id, "execution_done", event_data)
         return {"status": "done", "total_steps": len(result["task_results"])}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -102,6 +104,15 @@ async def api_generate_report(case_id: str):
 async def api_get_status(case_id: str):
     """현재 분석 상태 조회"""
     return get_session_status(case_id)
+
+
+@router.get("/{case_id}/graph")
+async def api_get_graph(case_id: str):
+    """노드 그래프 조회"""
+    result = get_node_graph(case_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="세션 또는 그래프 없음")
+    return result
 
 
 @router.websocket("/ws/{case_id}")

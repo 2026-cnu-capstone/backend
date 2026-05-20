@@ -39,6 +39,7 @@ from mcp_client.client import MCPClientManager
 from rag.embedding import Embedder
 from rag.pgvector_store import PgVectorStore
 from rag.service import RAGService
+from node_graph import get_graph_response
 from state.manager import ManagerState
 
 from app.ws_manager import manager as ws_manager
@@ -182,6 +183,7 @@ def get_session_status(case_id: str) -> dict[str, Any]:
     state = _analysis_states.get(case_id)
     if not state:
         return {"exists": False}
+    node_graph = state.get("node_graph")
     return {
         "exists": True,
         "phase": state.get("phase", "unknown"),
@@ -189,7 +191,26 @@ def get_session_status(case_id: str) -> dict[str, Any]:
         "task_results_count": len(state.get("task_results", [])),
         "has_strategy": bool(state.get("analysis_strategy")),
         "has_plan": bool(state.get("plan_steps")),
+        "node_graph": get_graph_response(node_graph) if node_graph else None,
     }
+
+
+def get_node_graph(case_id: str) -> dict[str, Any] | None:
+    """분석 세션의 노드 그래프 조회
+
+    Args:
+        case_id: 케이스 ID
+
+    Returns:
+        노드 그래프 API 응답 또는 None
+    """
+    state = _analysis_states.get(case_id)
+    if not state:
+        return None
+    node_graph = state.get("node_graph")
+    if not node_graph:
+        return None
+    return get_graph_response(node_graph)
 
 
 class WebSocketExecutionCallback:
@@ -273,9 +294,11 @@ async def start_analysis(case_id: str, disk_image_path: str, prompt: str) -> dic
     state = await run_strategy(state, llm, rag_service=rag)
     _analysis_states[case_id] = state
 
+    node_graph = state.get("node_graph")
     return {
         "strategy": state.get("analysis_strategy", ""),
         "system_profile": system_profile,
+        "node_graph": get_graph_response(node_graph) if node_graph else None,
     }
 
 
@@ -303,9 +326,11 @@ async def approve_strategy(case_id: str, approved: bool, feedback: str = "") -> 
         )
         state = await run_strategy(state, llm, rag_service=rag)
         _analysis_states[case_id] = state
+        node_graph = state.get("node_graph")
         return {
             "strategy": state.get("analysis_strategy", ""),
             "plan_ready": False,
+            "node_graph": get_graph_response(node_graph) if node_graph else None,
         }
 
     state = await run_planning(state, llm, mcp, rag_service=rag)
@@ -318,10 +343,12 @@ async def approve_strategy(case_id: str, approved: bool, feedback: str = "") -> 
         [{k: s.get(k) for k in ("name", "mcp_server", "tool")} for s in steps[:3]],
     )
 
+    node_graph = state.get("node_graph")
     return {
         "plan_text": state.get("analysis_plan", ""),
         "steps": steps,
         "plan_ready": True,
+        "node_graph": get_graph_response(node_graph) if node_graph else None,
     }
 
 
@@ -350,9 +377,11 @@ async def approve_plan(case_id: str, approved: bool, feedback: str = "") -> dict
         }
         state = await run_planning(state, llm, mcp, rag_service=rag)
         _analysis_states[case_id] = state
+        node_graph = state.get("node_graph")
         return {
             "plan_text": state.get("analysis_plan", ""),
             "steps": state.get("plan_steps", []),
+            "node_graph": get_graph_response(node_graph) if node_graph else None,
         }
 
     _analysis_states[case_id] = state
@@ -375,9 +404,11 @@ async def execute_analysis(case_id: str) -> dict[str, Any]:
     _analysis_states[case_id] = state
     clear_cancel(case_id)
 
+    node_graph = state.get("node_graph")
     return {
         "task_results": state.get("task_results", []),
         "evidence_repository": state.get("evidence_repository", []),
+        "node_graph": get_graph_response(node_graph) if node_graph else None,
     }
 
 
@@ -389,5 +420,13 @@ async def generate_report(case_id: str) -> dict[str, str]:
 
     llm = await get_llm()
     result = await run_report(state, llm)
+    node_graph = result.get("node_graph")
+    report_result = {
+        "summary": result.get("summary", ""),
+        "report": result.get("report", ""),
+        "dfxml": result.get("dfxml", ""),
+    }
+    if node_graph:
+        report_result["node_graph"] = get_graph_response(node_graph)
     cleanup_session(case_id)
-    return result
+    return report_result
