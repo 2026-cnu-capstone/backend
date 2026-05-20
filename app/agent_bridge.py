@@ -31,10 +31,14 @@ from agents.manager.graph import (
     run_strategy,
 )
 from config import LLMProvider, load_settings
+from database.engine import get_engine, init_db
 from llm_provider.base import BaseLLMProvider
 from llm_provider.openai import OpenAIProvider
 from llm_provider.anthropic import AnthropicProvider
 from mcp_client.client import MCPClientManager
+from rag.embedding import Embedder
+from rag.pgvector_store import PgVectorStore
+from rag.service import RAGService
 from state.manager import ManagerState
 
 from app.ws_manager import manager as ws_manager
@@ -45,6 +49,7 @@ MAX_SESSIONS = 50
 _settings = None
 _mcp: MCPClientManager | None = None
 _llm_cache: dict[str, BaseLLMProvider] = {}
+_rag_service: RAGService | None = None
 _analysis_states: OrderedDict[str, ManagerState] = OrderedDict()
 _cancel_flags: dict[str, bool] = {}
 
@@ -56,6 +61,30 @@ async def get_settings():
         config_path = AGENT_SRC.parent / "config" / "mcp_servers.json"
         _settings = load_settings(config_path)
     return _settings
+
+
+async def get_rag_service() -> RAGService | None:
+    """RAG 서비스 인스턴스 반환 (설정 비활성 시 None)"""
+    global _rag_service
+    if _rag_service is not None:
+        return _rag_service
+
+    settings = await get_settings()
+    if not settings.rag.enabled:
+        return None
+
+    engine = get_engine(settings.database_url)
+    await init_db(engine)
+
+    embedder = Embedder(settings.rag.embedding_model)
+    store = PgVectorStore(engine, embedder)
+    await store.ensure_extension()
+    _rag_service = RAGService(
+        store=store,
+        top_k=settings.rag.search_top_k,
+        similarity_threshold=settings.rag.similarity_threshold,
+    )
+    return _rag_service
 
 
 async def get_llm(api_choice: str = "default") -> BaseLLMProvider:
@@ -223,6 +252,7 @@ async def start_analysis(case_id: str, disk_image_path: str, prompt: str) -> dic
     _enforce_session_limit()
     mcp = await get_mcp()
     llm = await get_llm()
+    rag = await get_rag_service()
 
     system_profile = ""
     try:
@@ -240,7 +270,7 @@ async def start_analysis(case_id: str, disk_image_path: str, prompt: str) -> dic
         system_profile=system_profile,
     )
 
-    state = await run_strategy(state, llm)
+    state = await run_strategy(state, llm, rag_service=rag)
     _analysis_states[case_id] = state
 
     return {
@@ -257,6 +287,7 @@ async def approve_strategy(case_id: str, approved: bool, feedback: str = "") -> 
 
     llm = await get_llm()
     mcp = await get_mcp()
+    rag = await get_rag_service()
 
     if not approved and feedback:
         strategy = state.get("analysis_strategy", "")
@@ -270,14 +301,14 @@ async def approve_strategy(case_id: str, approved: bool, feedback: str = "") -> 
             disk_image_format=state.get("disk_image_format"),
             system_profile=state.get("system_profile"),
         )
-        state = await run_strategy(state, llm)
+        state = await run_strategy(state, llm, rag_service=rag)
         _analysis_states[case_id] = state
         return {
             "strategy": state.get("analysis_strategy", ""),
             "plan_ready": False,
         }
 
-    state = await run_planning(state, llm, mcp)
+    state = await run_planning(state, llm, mcp, rag_service=rag)
     _analysis_states[case_id] = state
 
     steps = state.get("plan_steps", [])
@@ -302,6 +333,7 @@ async def approve_plan(case_id: str, approved: bool, feedback: str = "") -> dict
 
     llm = await get_llm()
     mcp = await get_mcp()
+    rag = await get_rag_service()
 
     if not approved and feedback:
         plan = state.get("analysis_plan", "")
@@ -316,7 +348,7 @@ async def approve_plan(case_id: str, approved: bool, feedback: str = "") -> dict
                 ),
             }],
         }
-        state = await run_planning(state, llm, mcp)
+        state = await run_planning(state, llm, mcp, rag_service=rag)
         _analysis_states[case_id] = state
         return {
             "plan_text": state.get("analysis_plan", ""),
@@ -336,9 +368,10 @@ async def execute_analysis(case_id: str) -> dict[str, Any]:
     clear_cancel(case_id)
     llm = await get_llm()
     mcp = await get_mcp()
+    rag = await get_rag_service()
     callback = WebSocketExecutionCallback(case_id)
 
-    state = await run_execution(state, llm, mcp, callback=callback)
+    state = await run_execution(state, llm, mcp, callback=callback, rag_service=rag)
     _analysis_states[case_id] = state
     clear_cancel(case_id)
 
